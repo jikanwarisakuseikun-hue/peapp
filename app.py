@@ -99,8 +99,6 @@ elif menu == "先生メニュー":
     st.subheader("ログイン認証")
     
     auth_school = st.selectbox("学校名を選択してください", list(SCHOOL_MASTER.keys()), key="auth_school")
-    # 預かっているパスワードを画面に強制表示して確認する（テスト後消してください）
-st.write(f"🔍 システムが認識している正しいパスワード: 『{correct_password}』")
     password_input = st.text_input(f"「{auth_school}」の先生用パスワードを入力してください", type="password")
     correct_password = SCHOOL_PASSWORDS.get(auth_school, "")
     
