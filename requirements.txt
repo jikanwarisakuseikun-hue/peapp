@@ -1,4 +1,4 @@
-opencv-python-headless
+av
 mediapipe
 numpy
 google-auth
