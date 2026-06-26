@@ -4,11 +4,10 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import os
-import cv2
+import av  # OpenCVの代わりにPyAVを使用
 import mediapipe as mp
 import numpy as np
 
-# ページの設定
 st.set_page_config(page_title="AI採点機能付き 倒立見本動画管理システム", layout="centered")
 
 # ==========================================
@@ -48,13 +47,13 @@ MODEL_VIDEOS = MASTER_DATA.get("videos", {})
 
 
 # ==========================================
-# 3. 【新機能】AI骨格解析＆採点関数
+# 3. AI骨格解析＆採点ロジック (OpenCV不使用版)
 # ==========================================
 def calculate_angle(a, b, c):
-    """3点(a, b, c)の座標からなす角（角度）を計算する関数"""
-    a = np.array(a)  # 端点1 (例: 肩)
-    b = np.array(b)  # 頂点   (例: 腰)
-    c = np.array(c)  # 端点2 (例: 膝)
+    """3点の座標からなす角（角度）を計算する関数"""
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
     
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
     angle = np.abs(radians*180.0/np.pi)
@@ -64,59 +63,54 @@ def calculate_angle(a, b, c):
     return angle
 
 def analyze_pose_and_score(video_path):
-    """MediaPipeを使用して動画を解析し、スコアを算出するコアエンジン"""
+    """PyAVとMediaPipeを使用して動画を解析し、スコアを算出するコアエンジン"""
     mp_pose = mp.solutions.pose
     best_score = 0
     feedback_msg = "倒立の姿勢が検出できませんでした。全身が写るように撮影してください。"
     
-    # 動画ファイルの読み込み
-    cap = cv2.VideoCapture(video_path)
-    
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+    try:
+        # OpenCVの代わりにPyAVで動画をオープン
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        
+        with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+            # 動画のフレームを1枚ずつループ処理
+            for frame in container.decode(stream):
+                # PyAVのフレームを直接RGBのNumpy配列に変換
+                image = frame.to_ndarray(format='rgb24')
+                results = pose.process(image)
                 
-            # OpenCVはBGRなのでRGBに変換
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(image)
-            
-            if results.pose_landmarks:
-                landmarks = results.pose_landmarks.landmark
-                
-                # 必要な関節の座標を抽出 (左半身を基準に計算)
-                shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
-                hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
-                knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
-                
-                # 腰の角度（真っ直ぐ伸びているか）を計算
-                hip_angle = calculate_angle(shoulder, hip, knee)
-                
-                # 【採点ロジック】理想の180度（一直線）にどれだけ近いか
-                # 180度からのズレを計算
-                angle_diff = abs(180.0 - hip_angle)
-                
-                # ズレが0なら100点。1度ズレるごとに2.5点減点
-                current_score = int(100 - (angle_diff * 2.5))
-                current_score = max(0, min(100, current_score)) # 0〜100点に収める
-                
-                # 動画内で一番「真っ直ぐ綺麗に伸びた瞬間」を最高得点として記録
-                if current_score > best_score:
-                    best_score = current_score
-                    if best_score >= 90:
-                        feedback_msg = f"素晴らしい！体が完全に一直線（腰の角度: {hip_angle:.1f}度）に伸びています。この調子でキープ時間を伸ばしましょう！"
-                    elif best_score >= 75:
-                        feedback_msg = f"お見事！かなり綺麗な倒立です（腰の角度: {hip_angle:.1f}度）。もう少しお腹を引き締めると、さらに軸が安定します。"
-                    else:
-                        feedback_msg = f"少し腰が「くの字」に曲がっているか、反ってしまっています（腰の角度: {hip_angle:.1f}度）。お手本動画を見て、肩から足先まで一直線にする意識を持ちましょう。"
-                        
-    cap.release()
+                if results.pose_landmarks:
+                    landmarks = results.pose_landmarks.landmark
+                    
+                    # 左半身の重要関節（肩・腰・膝）をサンプリング
+                    shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
+                    hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
+                    knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
+                    
+                    hip_angle = calculate_angle(shoulder, hip, knee)
+                    angle_diff = abs(180.0 - hip_angle)
+                    
+                    # 理想の180度（一直線）からのズレに基づき100点満点で減点
+                    current_score = int(100 - (angle_diff * 2.5))
+                    current_score = max(0, min(100, current_score))
+                    
+                    if current_score > best_score:
+                        best_score = current_score
+                        if best_score >= 90:
+                            feedback_msg = f"素晴らしい！体が完全に一直線（腰の角度: {hip_angle:.1f}度）に伸びています。この調子でキープ時間を伸ばしましょう！"
+                        elif best_score >= 75:
+                            feedback_msg = f"お見事！かなり綺麗な倒立です（腰の角度: {hip_angle:.1f}度）。もう少しお腹を引き締めると、さらに軸が安定します。"
+                        else:
+                            feedback_msg = f"少し腰が「くの字」に曲がっているか、反ってしまっています（腰の角度: {hip_angle:.1f}度）。お手本動画を見て、肩から足先まで一直線にする意識を持ちましょう。"
+    except Exception as e:
+        feedback_msg = f"動画の解析中にエラーが発生しました: {e}"
+        
     return best_score, feedback_msg
 
 
 # ==========================================
-# 4. メニュー切り替え画面
+# 4. 画面レイアウト
 # ==========================================
 st.sidebar.title("ナビゲーション")
 menu = st.sidebar.radio("メニューを選択してください", ["生徒メニュー", "先生メニュー"])
@@ -165,7 +159,6 @@ if menu == "生徒メニュー":
             elif not available_videos:
                 st.error("⚠️ 技のメニューが正しく選択されていません。")
             else:
-                # 一時ファイルとして動画を保存
                 ext = os.path.splitext(student_file.name)[1]
                 custom_filename = f"{student_class}_{student_id}_{selected_model_name}{ext}"
                 temp_file_path = f"temp_{custom_filename}"
@@ -173,13 +166,11 @@ if menu == "生徒メニュー":
                 with open(temp_file_path, "wb") as f:
                     f.write(student_file.getbuffer())
 
-                # --- 【ここからAI採点実行】 ---
                 status_text = st.empty()
                 status_text.info("🤖 AIがあなたの骨格を抽出中... 動画を解析しています...")
                 
                 score, feedback = analyze_pose_and_score(temp_file_path)
                 
-                # 画面にドカンと点数を表示
                 st.markdown(f"## 📊 AI採点結果: **{score} 点** / 100点満点")
                 if score >= 80:
                     st.success(feedback)
@@ -188,7 +179,6 @@ if menu == "生徒メニュー":
                 else:
                     st.error(feedback)
                 
-                # --- 【ここからGoogleドライブへのアップロードと仕分け】 ---
                 progress_bar = st.progress(0)
                 status_text.text("Googleドライブへ提出動画を送信中...")
 
@@ -198,7 +188,6 @@ if menu == "生徒メニュー":
                         service_account_info, scopes=SCOPES)
                     drive_service = build('drive', 'v3', credentials=creds)
 
-                    # ファイル名に点数も自動でドッキングして先生に見やすくする
                     final_filename = f"【{score}点】{student_class}_{student_id}_{selected_model_name}{ext}"
 
                     file_metadata = {
@@ -236,7 +225,7 @@ if menu == "生徒メニュー":
                         "status": "success",
                         "school": student_school,
                         "class": student_class,
-                        "student_id": f"{student_id}_(Score:{score})", # 点数もGAS側に送信 
+                        "student_id": f"{student_id}_(Score:{score})", 
                         "file_name": final_filename,
                         "file_id": file_id,
                         "file_url": file_url
