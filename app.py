@@ -4,9 +4,12 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import os
+import cv2
+import mediapipe as mp
+import numpy as np
 
 # ページの設定
-st.set_page_config(page_title="学校向け 倒立見本動画管理システム", layout="centered")
+st.set_page_config(page_title="AI採点機能付き 倒立見本動画管理システム", layout="centered")
 
 # ==========================================
 # 1. 共通設定・環境チェック（Secretsから取得）
@@ -21,9 +24,9 @@ except Exception as e:
 
 
 # ==========================================
-# 2. GAS（スプレッドシート）から全てのマスタデータを自動取得
+# 2. GASから全てのマスタデータを自動取得
 # ==========================================
-@st.cache_data(ttl=300)  # 5分間キャッシュ
+@st.cache_data(ttl=300)
 def load_all_master_data():
     try:
         response = requests.get(GAS_URL, timeout=10)
@@ -38,7 +41,6 @@ def load_all_master_data():
         "videos": {"エラー：技が読み込めませんでした": {"url": "", "points": ""}}
     }
 
-# マスタデータの読み込み
 MASTER_DATA = load_all_master_data()
 SCHOOL_MASTER = MASTER_DATA.get("schools", {})
 SCHOOL_PASSWORDS = MASTER_DATA.get("passwords", {})
@@ -46,16 +48,84 @@ MODEL_VIDEOS = MASTER_DATA.get("videos", {})
 
 
 # ==========================================
-# 3. サイドバーによるメニュー切り替え
+# 3. 【新機能】AI骨格解析＆採点関数
+# ==========================================
+def calculate_angle(a, b, c):
+    """3点(a, b, c)の座標からなす角（角度）を計算する関数"""
+    a = np.array(a)  # 端点1 (例: 肩)
+    b = np.array(b)  # 頂点   (例: 腰)
+    c = np.array(c)  # 端点2 (例: 膝)
+    
+    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    angle = np.abs(radians*180.0/np.pi)
+    
+    if angle > 180.0:
+        angle = 360 - angle
+    return angle
+
+def analyze_pose_and_score(video_path):
+    """MediaPipeを使用して動画を解析し、スコアを算出するコアエンジン"""
+    mp_pose = mp.solutions.pose
+    best_score = 0
+    feedback_msg = "倒立の姿勢が検出できませんでした。全身が写るように撮影してください。"
+    
+    # 動画ファイルの読み込み
+    cap = cv2.VideoCapture(video_path)
+    
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # OpenCVはBGRなのでRGBに変換
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(image)
+            
+            if results.pose_landmarks:
+                landmarks = results.pose_landmarks.landmark
+                
+                # 必要な関節の座標を抽出 (左半身を基準に計算)
+                shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
+                hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
+                knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
+                
+                # 腰の角度（真っ直ぐ伸びているか）を計算
+                hip_angle = calculate_angle(shoulder, hip, knee)
+                
+                # 【採点ロジック】理想の180度（一直線）にどれだけ近いか
+                # 180度からのズレを計算
+                angle_diff = abs(180.0 - hip_angle)
+                
+                # ズレが0なら100点。1度ズレるごとに2.5点減点
+                current_score = int(100 - (angle_diff * 2.5))
+                current_score = max(0, min(100, current_score)) # 0〜100点に収める
+                
+                # 動画内で一番「真っ直ぐ綺麗に伸びた瞬間」を最高得点として記録
+                if current_score > best_score:
+                    best_score = current_score
+                    if best_score >= 90:
+                        feedback_msg = f"素晴らしい！体が完全に一直線（腰の角度: {hip_angle:.1f}度）に伸びています。この調子でキープ時間を伸ばしましょう！"
+                    elif best_score >= 75:
+                        feedback_msg = f"お見事！かなり綺麗な倒立です（腰の角度: {hip_angle:.1f}度）。もう少しお腹を引き締めると、さらに軸が安定します。"
+                    else:
+                        feedback_msg = f"少し腰が「くの字」に曲がっているか、反ってしまっています（腰の角度: {hip_angle:.1f}度）。お手本動画を見て、肩から足先まで一直線にする意識を持ちましょう。"
+                        
+    cap.release()
+    return best_score, feedback_msg
+
+
+# ==========================================
+# 4. メニュー切り替え画面
 # ==========================================
 st.sidebar.title("ナビゲーション")
 menu = st.sidebar.radio("メニューを選択してください", ["生徒メニュー", "先生メニュー"])
 
 
-# ---【生徒メニュー】------------------------------------
+# ---【生徒メニュー（AI自動採点機能搭載）】------------------------------------
 if menu == "生徒メニュー":
-    st.title("🏃 生徒向けメニュー")
-    st.write("今日取り組むお手本を選んで練習し、結果を報告・提出しましょう。")
+    st.title("🏃 AI採点対応・生徒メニュー")
+    st.write("今日取り組むお手本を確認し、動画を提出してAIに採点してもらいましょう！")
     
     st.markdown("---")
     st.subheader("1. あなたの情報を入力")
@@ -63,12 +133,11 @@ if menu == "生徒メニュー":
     student_school = st.selectbox("学校名を選択してください", list(SCHOOL_MASTER.keys()), key="student_school")
     classes = SCHOOL_MASTER.get(student_school, [])
     student_class = st.selectbox("クラスを選択してください", classes, key="student_class")
-    student_id = st.text_input("生徒番号、または氏名を入力してください")
+    student_id = st.text_input("生徒番号、または氏名を入力してください（例：05番 佐藤）")
     
     st.markdown("---")
     st.subheader("2. 今日取り組むお手本を選ぶ")
     
-    # 選ばれたクラスに応じて、表示する動画リストを動的に作成
     class_videos = MODEL_VIDEOS.get(student_class, {})
     common_videos = MODEL_VIDEOS.get("共通", {})
     available_videos = {**common_videos, **class_videos}
@@ -86,14 +155,111 @@ if menu == "生徒メニュー":
         st.warning("⚠️ 選択されたクラス向けのお手本動画が登録されていません。")
         
     st.markdown("---")
-    if st.button("今日の取り組みを記録（確認送信）"):
-        if student_id != "" and available_videos:
-            st.success(f"🎉 {student_id}さんの 「{selected_model_name}」 への取り組みを記録しました！")
-        else:
-            st.warning("⚠️ 記録のために生徒番号または氏名を入力してください。")
+    st.subheader("3. 自分の動画を撮影・提出してAI採点！")
+    student_file = st.file_uploader("撮影した自分の動画（MP4形式など）を選択してください", type=["mp4", "mov", "avi"])
+    
+    if student_file is not None:
+        if st.button("AI採点＆動画を提出する"):
+            if student_id == "":
+                st.warning("⚠️ 生徒番号または氏名を必ず入力してください。")
+            elif not available_videos:
+                st.error("⚠️ 技のメニューが正しく選択されていません。")
+            else:
+                # 一時ファイルとして動画を保存
+                ext = os.path.splitext(student_file.name)[1]
+                custom_filename = f"{student_class}_{student_id}_{selected_model_name}{ext}"
+                temp_file_path = f"temp_{custom_filename}"
+                
+                with open(temp_file_path, "wb") as f:
+                    f.write(student_file.getbuffer())
+
+                # --- 【ここからAI採点実行】 ---
+                status_text = st.empty()
+                status_text.info("🤖 AIがあなたの骨格を抽出中... 動画を解析しています...")
+                
+                score, feedback = analyze_pose_and_score(temp_file_path)
+                
+                # 画面にドカンと点数を表示
+                st.markdown(f"## 📊 AI採点結果: **{score} 点** / 100点満点")
+                if score >= 80:
+                    st.success(feedback)
+                elif score >= 60:
+                    st.warning(feedback)
+                else:
+                    st.error(feedback)
+                
+                # --- 【ここからGoogleドライブへのアップロードと仕分け】 ---
+                progress_bar = st.progress(0)
+                status_text.text("Googleドライブへ提出動画を送信中...")
+
+                try:
+                    SCOPES = ['https://www.googleapis.com/auth/drive']
+                    creds = service_account.Credentials.from_service_account_info(
+                        service_account_info, scopes=SCOPES)
+                    drive_service = build('drive', 'v3', credentials=creds)
+
+                    # ファイル名に点数も自動でドッキングして先生に見やすくする
+                    final_filename = f"【{score}点】{student_class}_{student_id}_{selected_model_name}{ext}"
+
+                    file_metadata = {
+                        'name': final_filename,
+                        'parents': [TEMP_FOLDER_ID]
+                    }
+
+                    media = MediaFileUpload(
+                        temp_file_path, 
+                        mimetype='video/mp4',
+                        chunksize=1024 * 1024,
+                        resumable=True
+                    )
+                    
+                    request = drive_service.files().create(
+                        body=file_metadata, 
+                        media_body=media, 
+                        fields='id, webViewLink'
+                    )
+                    
+                    response = None
+                    while response is None:
+                        status, response = request.next_chunk()
+                        if status:
+                            progress_percent = int(status.progress() * 100)
+                            progress_bar.progress(progress_percent)
+
+                    file_id = response.get('id')
+                    file_url = response.get('webViewLink')
+                    
+                    status_text.text("クラス別フォルダへの自動仕分け中...")
+                    
+                    payload = {
+                        "action": "upload_video",
+                        "status": "success",
+                        "school": student_school,
+                        "class": student_class,
+                        "student_id": f"{student_id}_(Score:{score})", # 点数もGAS側に送信 
+                        "file_name": final_filename,
+                        "file_id": file_id,
+                        "file_url": file_url
+                    }
+                    
+                    gas_response = requests.post(GAS_URL, json=payload, timeout=30)
+                    
+                    if gas_response.status_code == 200:
+                        st.success(f"🎉 動画の提出とAI仕分けがすべて完了しました！送信お疲れ様でした！")
+                        if score >= 80:
+                            st.balloons()
+                    else:
+                        st.error("⚠️ ドライブ保存は成功しましたが、GAS仕分けでエラーが発生しました。")
+
+                except Exception as e:
+                    st.error(f"🚨 提出エラーが発生しました:\n{e}")
+                finally:
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
+                    status_text.empty()
 
 
-# ---【先生メニュー（パスワードロック付き・学校連動版）】------------------
+# ---【先生メニュー】--------------------------------------------------------
 elif menu == "先生メニュー":
     st.title("👨‍🏫 先生向けメニュー")
     st.subheader("ログイン認証")
@@ -141,7 +307,6 @@ elif menu == "先生メニュー":
                 status_text.text("Google Drive API 認証中...")
 
                 try:
-                    # Google Drive API 認証
                     SCOPES = ['https://www.googleapis.com/auth/drive']
                     creds = service_account.Credentials.from_service_account_info(
                         service_account_info, scopes=SCOPES)
@@ -158,8 +323,6 @@ elif menu == "先生メニュー":
                         chunksize=1024 * 1024,
                         resumable=True
                     )
-
-                    status_text.text("Googleドライブへアップロード中...")
                     
                     request = drive_service.files().create(
                         body=file_metadata, 
@@ -173,7 +336,6 @@ elif menu == "先生メニュー":
                         if status:
                             progress_percent = int(status.progress() * 100)
                             progress_bar.progress(progress_percent)
-                            status_text.text(f"ドライブ送信進捗: {progress_percent}%")
 
                     file_id = response.get('id')
                     file_url = response.get('webViewLink')
@@ -195,16 +357,12 @@ elif menu == "先生メニュー":
                     gas_response = requests.post(GAS_URL, json=payload, timeout=30)
                     
                     if gas_response.status_code == 200:
-                        st.success("🎉 本命フォルダへの仕分け・URL記録が完了しました！")
-                        st.info(f"システムからの返答: {gas_response.text}")
+                        st.success("🎉 本命フォルダへの仕分けが完了しました！")
                     else:
-                        st.error(f"⚠️ GAS側の仕分け処理でエラーが発生しました (Status: {gas_response.status_code})")
+                        st.error("⚠️ GAS側の仕分け処理でエラーが発生しました。")
 
                 except Exception as e:
                     st.error(f"🚨 アップロード中にエラーが発生しました:\n{e}")
                 finally:
                     if os.path.exists(temp_file_path):
                         os.remove(temp_file_path)
-        else:
-            if uploaded_file is not None and target_id == "":
-                st.warning("⚠️ 識別用の生徒番号またはIDを入力してください。")
